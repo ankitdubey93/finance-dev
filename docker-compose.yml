@@ -1,0 +1,90 @@
+# Portfolio platform + first tool (Agentic RAG Router), full stack.
+# `docker compose up db` for Postgres only; `docker compose up` for everything.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finance}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finance}
+      POSTGRES_DB: ${POSTGRES_DB:-finance}
+    ports:
+      # Host 5433 → container 5432 (host 5432 is taken by an unrelated container
+      # on this machine). Services still reach Postgres internally via db:5432.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs alphabetically on first init: extension + roles, then schema, then seed.
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finance} -d ${POSTGRES_DB:-finance}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rag-router-ai:
+    build:
+      context: .
+      dockerfile: infra/docker/rag-router-ai.Dockerfile
+    environment:
+      RAG_ROUTER_AI_PORT: ${RAG_ROUTER_AI_PORT:-8101}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://finance:finance@db:5432/finance}
+      RAG_ROUTER_READONLY_URL: ${RAG_ROUTER_READONLY_URL:-postgresql://rag_readonly:rag_readonly@db:5432/finance}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      RAG_ROUTER_ROUTE_MODEL: ${RAG_ROUTER_ROUTE_MODEL:-claude-haiku-4-5}
+      RAG_ROUTER_SYNTH_MODEL: ${RAG_ROUTER_SYNTH_MODEL:-claude-opus-4-8}
+      RAG_ROUTER_EMBED_MODEL: ${RAG_ROUTER_EMBED_MODEL:-text-embedding-004}
+      RAG_ROUTER_EMBED_DIM: ${RAG_ROUTER_EMBED_DIM:-768}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${RAG_ROUTER_AI_PORT:-8101}:8101"
+
+  rag-router-api:
+    build:
+      context: .
+      dockerfile: infra/docker/rag-router-api.Dockerfile
+    environment:
+      RAG_ROUTER_API_PORT: ${RAG_ROUTER_API_PORT:-3101}
+      RAG_ROUTER_AI_URL: ${RAG_ROUTER_AI_URL:-http://rag-router-ai:8101}
+    depends_on:
+      - rag-router-ai
+    ports:
+      - "${RAG_ROUTER_API_PORT:-3101}:3101"
+
+  platform-api:
+    build:
+      context: .
+      dockerfile: infra/docker/platform-api.Dockerfile
+    environment:
+      PLATFORM_API_PORT: ${PLATFORM_API_PORT:-3000}
+      RAG_ROUTER_API_URL: ${RAG_ROUTER_API_URL:-http://rag-router-api:3101}
+      # Gateway owns the `platform` schema (companies/tenants) only.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://finance:finance@db:5432/finance}
+    depends_on:
+      db:
+        condition: service_healthy
+      rag-router-api:
+        condition: service_started
+    # Internal-only: the browser reaches the gateway through the web SPA's Vite
+    # proxy over the compose network, so no host port publish is needed.
+    # (Add `ports: ["3000:3000"]` here if you want to curl the gateway directly.)
+    expose:
+      - "3000"
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    environment:
+      # SPA talks to the gateway only. In dev the Vite proxy forwards /api → platform-api.
+      PLATFORM_API_URL: ${PLATFORM_API_URL:-http://platform-api:3000}
+    depends_on:
+      - platform-api
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+
+volumes:
+  pgdata:
